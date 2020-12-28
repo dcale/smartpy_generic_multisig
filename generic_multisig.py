@@ -42,8 +42,10 @@ class Executor(sp.Contract):
             signers_threshold=sp.nat(2), 
             operator_public_keys=operator_public_keys,
 
-            # If greater than 0, proposals are placed in the timelock for later execution after `timelock_seconds`
-            timelock_seconds = sp.nat(0),
+            # Optional nat. 
+            # If `some`, then valid proposals are timelocked for the value's seconds.
+            # If `none`, proposals are executed immediately.
+            timelock_seconds = sp.none,
 
             # Map of <nonce>:<execution request>
             timelock = sp.big_map(
@@ -57,7 +59,7 @@ class Executor(sp.Contract):
                 nonce=sp.TNat, 
                 signers_threshold=sp.TNat, 
                 operator_public_keys=sp.TList(sp.TKey),
-                timelock_seconds = sp.TNat,
+                timelock_seconds = sp.TOption(sp.TNat),
                 timelock = sp.TBigMap(sp.TNat, TIMELOCK_TYPE)
             )
         )
@@ -74,10 +76,10 @@ class Executor(sp.Contract):
         sp.verify(valid_signatures_counter.value >= self.data.signers_threshold)
 
         # Optionally timelock the request.
-        sp.if self.data.timelock_seconds == 0:
-            sp.add_operations(execution_request.execution_payload(sp.unit).rev())
-        sp.else:
+        sp.if self.data.timelock_seconds.is_some():
             self.data.timelock[self.data.nonce] = (sp.now, execution_request)
+        sp.else:
+            sp.add_operations(execution_request.execution_payload(sp.unit).rev())
 
         self.data.nonce += 1
 
@@ -91,7 +93,7 @@ class Executor(sp.Contract):
         timelock_start, execution_request = sp.match_pair(timelock_value)
 
         # Verify time has been exceeded.
-        execution_time = timelock_start.add_seconds(sp.to_int(self.data.timelock_seconds))
+        execution_time = timelock_start.add_seconds(sp.to_int(self.data.timelock_seconds.open_some()))
         sp.verify(execution_time < sp.now, "TOO_EARLY")
 
         # Execute request.        
