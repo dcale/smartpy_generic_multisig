@@ -30,10 +30,37 @@ class LambdaPacker(sp.Contract):
             sp.result([sp.transfer_operation(sp.unit, sp.mutez(0), honey_pot_contract)])
         self.init(payload=execution_payload)
     
+# Type for values in the timelock map. 
+# Timestamp is the time the execution request was added to the timelock
+# Execution requiest is the request to execute.    
+TIMELOCK_TYPE = sp.TPair(sp.TTimestamp, ExecutionRequest.get_type())
+
 class Executor(sp.Contract):
     def __init__(self, signers_threshold, operator_public_keys):
-        self.init(nonce=sp.nat(0), signers_threshold=sp.nat(2), operator_public_keys=operator_public_keys)
-        self.init_type(sp.TRecord(nonce=sp.TNat, signers_threshold=sp.TNat, operator_public_keys=sp.TList(sp.TKey)))
+        self.init(
+            nonce=sp.nat(0), 
+            signers_threshold=sp.nat(2), 
+            operator_public_keys=operator_public_keys,
+
+            # If greater than 0, proposals are placed in the timelock for later execution after `timelock_seconds`
+            timelock_seconds = sp.nat(0),
+
+            # Map of <nonce>:<execution request>
+            timelock = sp.big_map(
+                l = {},
+                tkey = sp.TNat,
+                tvalue = TIMELOCK_TYPE
+            )
+        )
+        self.init_type(
+            sp.TRecord(
+                nonce=sp.TNat, 
+                signers_threshold=sp.TNat, 
+                operator_public_keys=sp.TList(sp.TKey),
+                timelock_seconds = sp.TNat,
+                timelock = sp.TBigMap(sp.TNat, TIMELOCK_TYPE)
+            )
+        )
 
     @sp.entry_point
     def execute(self, execution_request):
@@ -45,7 +72,29 @@ class Executor(sp.Contract):
             sp.if sp.check_signature(operator_public_key, execution_request.signatures[sp.hash_key(operator_public_key)], sp.pack(signing_payload)):
                 valid_signatures_counter.value += 1
         sp.verify(valid_signatures_counter.value >= self.data.signers_threshold)
-        self.data.nonce += 1 
+
+        # Optionally timelock the request.
+        sp.if self.data.timelock_seconds == 0:
+            sp.add_operations(execution_request.execution_payload(sp.unit).rev())
+        sp.else:
+            self.data.timelock[self.data.nonce] = (sp.now, execution_request)
+
+        self.data.nonce += 1
+
+    # Param: A nat representing the nonce for the proposal to execute. 
+    @sp.entry_point
+    def executeTimelock(self, nonce):
+        sp.set_type(nonce, sp.TNat)
+
+        # Get timelock. Will fail if there's no request for nonce.
+        timelock_value = self.data.timelock[nonce]
+        timelock_start, execution_request = sp.match_pair(timelock_value)
+
+        # Verify time has been exceeded.
+        execution_time = timelock_start.add_seconds(sp.to_int(self.data.timelock_seconds))
+        sp.verify(execution_time < sp.now, "TOO_EARLY")
+
+        # Execute request.        
         sp.add_operations(execution_request.execution_payload(sp.unit).rev())
 
 @sp.add_test(name = "Lambdas")
