@@ -29,11 +29,19 @@ class LambdaPacker(sp.Contract):
             honey_pot_contract = sp.contract(sp.TUnit, honeypot).open_some()
             sp.result([sp.transfer_operation(sp.unit, sp.mutez(0), honey_pot_contract)])
         self.init(payload=execution_payload)
-    
+
 class Executor(sp.Contract):
+    def get_init_storage(self):
+        return dict(
+            nonce=sp.nat(0), 
+            signers_threshold= sp.set_type_expr(self.signers_threshold, sp.TNat), 
+            operator_public_keys= sp.set_type_expr(self.operator_public_keys,sp.TList(sp.TKey))
+        )
+    
     def __init__(self, signers_threshold, operator_public_keys):
-        self.init(nonce=sp.nat(0), signers_threshold=sp.nat(2), operator_public_keys=operator_public_keys)
-        self.init_type(sp.TRecord(nonce=sp.TNat, signers_threshold=sp.TNat, operator_public_keys=sp.TList(sp.TKey)))
+        self.signers_threshold = signers_threshold
+        self.operator_public_keys = operator_public_keys
+        self.init(**self.get_init_storage())
 
     @sp.entry_point
     def execute(self, execution_request):
@@ -45,8 +53,50 @@ class Executor(sp.Contract):
             sp.if sp.check_signature(operator_public_key, execution_request.signatures[sp.hash_key(operator_public_key)], sp.pack(signing_payload)):
                 valid_signatures_counter.value += 1
         sp.verify(valid_signatures_counter.value >= self.data.signers_threshold)
-        self.data.nonce += 1 
+        self.data.nonce += 1
         sp.add_operations(execution_request.execution_payload(sp.unit).rev())
+        
+
+
+class TimelockedExecutionRequest():
+    def get_type():
+        return sp.TRecord(creation_timestamp=sp.TTimestamp, execution_request=ExecutionRequest.get_type()).layout(("creation_timestamp", "execution_request"))
+
+
+class TimeLockedExecutor(Executor):
+    def get_init_storage(self):
+        storage = super().get_init_storage()
+        storage['timelock_seconds'] = sp.set_type_expr(self.timelock_seconds, sp.TNat)
+        storage['timelocked_execution_requests'] = sp.set_type_expr(sp.list(), sp.TList(TimelockedExecutionRequest.get_type()))
+        return storage
+    
+    def __init__(self, signers_threshold, operator_public_keys, timelock_seconds):
+        self.timelock_seconds = timelock_seconds
+        super().__init__(signers_threshold, operator_public_keys)
+        
+    @sp.entry_point
+    def execute(self, execution_request): # we call this entrypoint execute if we want to overwrite the standard behaviour
+        sp.set_type(execution_request, ExecutionRequest.get_type())
+        signing_payload = ExecutionRequest.get_signing_payload(sp.chain_id, self.data.nonce+sp.nat(1), execution_request.execution_payload)
+        
+        valid_signatures_counter = sp.local('valid_signatures_counter', sp.nat(0))
+        sp.for operator_public_key in self.data.operator_public_keys:
+            sp.if sp.check_signature(operator_public_key, execution_request.signatures[sp.hash_key(operator_public_key)], sp.pack(signing_payload)):
+                valid_signatures_counter.value += 1
+        sp.verify(valid_signatures_counter.value >= self.data.signers_threshold)
+        self.data.timelocked_execution_requests.push(sp.record(creation_timestamp=sp.now, execution_request=execution_request))
+        self.data.nonce += 1
+
+    @sp.entry_point
+    def execute_timelocks(self):
+        non_mature_timelocked_execution_requests = sp.local('non_mature_timelocked_execution_requests', sp.list(t=TimelockedExecutionRequest.get_type()))
+        sp.for timelocked_execution_request in self.data.timelocked_execution_requests:
+            sp.if timelocked_execution_request.creation_timestamp.add_seconds(sp.to_int(self.data.timelock_seconds)) < sp.now:
+                sp.add_operations(timelocked_execution_request.execution_request.execution_payload(sp.unit).rev())
+            sp.else:
+                non_mature_timelocked_execution_requests.value.push(timelocked_execution_request)
+        self.data.timelocked_execution_requests = non_mature_timelocked_execution_requests.value
+
 
 @sp.add_test(name = "Lambdas")
 def test():
@@ -101,6 +151,10 @@ def test():
     
     execution_request = sp.set_type_expr(sp.record(execution_payload=execution_payload, signatures=signatures),ExecutionRequest.get_type())
     scenario.show(signatures)
+    
+    
+    executor = TimeLockedExecutor(sp.nat(2), [alice.public_key, bob.public_key, dan.public_key], sp.nat(60))
+    scenario += executor
     
     #scenario += executor.execute(execution_request).run(sender=admin, chain_id=sp.chain_id_cst("0x7a06a770"))
     #scenario += executor.default(test2).run(sender=admin)
